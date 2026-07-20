@@ -1,0 +1,261 @@
+diff --git a/ffmpeg-android-maker.sh b/ffmpeg-android-maker.sh
+index 8f83171..b71ae53 100755
+--- a/ffmpeg-android-maker.sh
++++ b/ffmpeg-android-maker.sh
+@@ -36,6 +36,18 @@ function prepareOutput() {
+   mkdir -p ${OUTPUT_LIB}
+   cp ${BUILD_DIR_FFMPEG}/${ANDROID_ABI}/lib/*.so ${OUTPUT_LIB}
+ 
++  # PocketScript addition: most external libraries (freetype, harfbuzz) build
++  # static-only and produce no .so here. libass and libfribidi are the exception —
++  # both are deliberately built shared (see their build.sh scripts) and never get
++  # copied by the stock script above, which only looks at BUILD_DIR_FFMPEG. Glob
++  # is safe: it silently matches nothing if a component built static-only.
++  shopt -s nullglob
++  EXTERNAL_SO_FILES=(${BUILD_DIR_EXTERNAL}/${ANDROID_ABI}/lib/*.so)
++  if [ ${#EXTERNAL_SO_FILES[@]} -gt 0 ]; then
++    cp ${EXTERNAL_SO_FILES[@]} ${OUTPUT_LIB}
++  fi
++  shopt -u nullglob
++
+   OUTPUT_HEADERS=${OUTPUT_DIR}/include/${ANDROID_ABI}
+   mkdir -p ${OUTPUT_HEADERS}
+   cp -r ${BUILD_DIR_FFMPEG}/${ANDROID_ABI}/include/* ${OUTPUT_HEADERS}
+@@ -48,6 +60,14 @@ function checkTextRelocations() {
+   TEXT_REL_STATS_FILE=${STATS_DIR}/text-relocations.txt
+   ${FAM_READELF} --dynamic ${BUILD_DIR_FFMPEG}/${ANDROID_ABI}/lib/*.so | grep 'TEXTREL\|File' >> ${TEXT_REL_STATS_FILE}
+ 
++  # PocketScript addition: also check libass.so/libfribidi.so (see prepareOutput).
++  shopt -s nullglob
++  EXTERNAL_SO_FILES=(${BUILD_DIR_EXTERNAL}/${ANDROID_ABI}/lib/*.so)
++  if [ ${#EXTERNAL_SO_FILES[@]} -gt 0 ]; then
++    ${FAM_READELF} --dynamic ${EXTERNAL_SO_FILES[@]} | grep 'TEXTREL\|File' >> ${TEXT_REL_STATS_FILE}
++  fi
++  shopt -u nullglob
++
+   if grep -q TEXTREL ${TEXT_REL_STATS_FILE}; then
+     echo "There are text relocations in output files:"
+     cat ${TEXT_REL_STATS_FILE}
+diff --git a/scripts/ffmpeg/build.sh b/scripts/ffmpeg/build.sh
+index 703ac96..3bb9ee0 100755
+--- a/scripts/ffmpeg/build.sh
++++ b/scripts/ffmpeg/build.sh
+@@ -14,6 +14,11 @@ if [ "$FFMPEG_GPL_ENABLED" = true ] ; then
+     EXTRA_BUILD_CONFIGURATION_FLAGS="$EXTRA_BUILD_CONFIGURATION_FLAGS --enable-gpl"
+ fi
+ 
++# PocketScript addition: JNI + hardware MediaCodec support (h264_mediacodec
++# encoder for burn-in, av_jni_set_java_vm() at init). Not exposed by this
++# framework's own CLI, so wired directly here.
++EXTRA_BUILD_CONFIGURATION_FLAGS="$EXTRA_BUILD_CONFIGURATION_FLAGS --enable-jni --enable-mediacodec"
++
+ # Preparing flags for enabling requested libraries
+ ADDITIONAL_COMPONENTS=
+ for LIBARY_NAME in ${FFMPEG_EXTERNAL_LIBRARIES[@]}
+diff --git a/scripts/libass/build.sh b/scripts/libass/build.sh
+new file mode 100755
+index 0000000..6aba931
+--- /dev/null
++++ b/scripts/libass/build.sh
+@@ -0,0 +1,30 @@
++#!/usr/bin/env bash
++
++# Custom external library (not built into ffmpeg-android-maker's supported-libraries
++# list). Built SHARED and merged with freetype+harfbuzz (both static, ISC/MIT/FTL —
++# permissively licensed, safe to merge). fribidi stays fribidi's own separate .so (LGPL,
++# see libfribidi/build.sh) and is picked up here purely via dynamic linking through
++# pkg-config, never statically absorbed.
++
++./configure \
++    --prefix=${INSTALL_DIR} \
++    --host=${TARGET} \
++    --disable-static \
++    --enable-shared \
++    --with-pic \
++    --disable-fontconfig \
++    --disable-directwrite \
++    --disable-coretext \
++    --disable-libunibreak \
++    --disable-require-system-font-provider \
++    --disable-test \
++    --disable-compare \
++    --disable-profile \
++    --disable-fuzz \
++    CC=${FAM_CC} \
++    AR=${FAM_AR} \
++    RANLIB=${FAM_RANLIB} || exit 1
++
++${MAKE_EXECUTABLE} clean
++${MAKE_EXECUTABLE} -j${HOST_NPROC}
++${MAKE_EXECUTABLE} install
+diff --git a/scripts/libass/download.sh b/scripts/libass/download.sh
+new file mode 100755
+index 0000000..723d013
+--- /dev/null
++++ b/scripts/libass/download.sh
+@@ -0,0 +1,9 @@
++#!/usr/bin/env bash
++
++source ${SCRIPTS_DIR}/common-functions.sh
++
++LIBASS_VERSION=0.17.5
++
++downloadTarArchive \
++  "libass" \
++  "https://github.com/libass/libass/releases/download/${LIBASS_VERSION}/libass-${LIBASS_VERSION}.tar.gz"
+diff --git a/scripts/libfribidi/build.sh b/scripts/libfribidi/build.sh
+index 0aaf74f..db375bd 100755
+--- a/scripts/libfribidi/build.sh
++++ b/scripts/libfribidi/build.sh
+@@ -1,11 +1,19 @@
+ #!/usr/bin/env bash
+ 
++# PATCHED from ffmpeg-android-maker's stock libfribidi/build.sh: --enable-shared
++# instead of --enable-static. LGPL compliance requires fribidi to ship as its
++# own dynamically-linked .so, never statically merged into
++# an app-owned binary — unlike libass/freetype/harfbuzz, which are permissively
++# licensed and may merge into one .so. This is the one library in the external-libs
++# set where the framework's stock "everything builds static, only FFmpeg's own
++# build.sh produces .so files" default is wrong for us.
++
+ ./configure \
+     --prefix=${INSTALL_DIR} \
+     --host=${TARGET} \
+     --with-sysroot=${SYSROOT_PATH} \
+-    --disable-shared \
+-    --enable-static \
++    --enable-shared \
++    --disable-static \
+     --disable-dependency-tracking \
+     --disable-fast-install \
+     --disable-debug \
+@@ -16,7 +24,7 @@
+     RANLIB=${FAM_RANLIB} || exit 1
+ 
+ ${MAKE_EXECUTABLE} clean
+-# Compiling only the static library. Just 'make' will build an executable and docs as well.
++# Compiling only the library. Just 'make' will build an executable and docs as well.
+ ${MAKE_EXECUTABLE} -j${HOST_NPROC} -C lib
+ ${MAKE_EXECUTABLE} install -C lib
+ # Installing the .pc file
+diff --git a/scripts/libharfbuzz/build.sh b/scripts/libharfbuzz/build.sh
+new file mode 100755
+index 0000000..86b0677
+--- /dev/null
++++ b/scripts/libharfbuzz/build.sh
+@@ -0,0 +1,63 @@
++#!/usr/bin/env bash
++
++# Custom external library (harfbuzz switched to Meson-only builds; no autotools
++# support since ~3.0). Built as a static lib to merge into libass.so (see
++# libass/build.sh) — permissively licensed, safe to merge libass/freetype/harfbuzz into one .so.
++
++CROSS_FILE_NAME=crossfile-${ANDROID_ABI}.meson
++
++rm -f ${CROSS_FILE_NAME}
++
++cat > "${CROSS_FILE_NAME}" << EOF
++[binaries]
++c = '${FAM_CC}'
++cpp = '${FAM_CXX}'
++ar = '${FAM_AR}'
++strip = '${FAM_STRIP}'
++pkgconfig = '${PKG_CONFIG_EXECUTABLE}'
++
++[properties]
++needs_exe_wrapper = true
++# Deliberately NOT setting sys_root here: our external-library install prefix
++# (${INSTALL_DIR}) lives outside the NDK sysroot entirely. Meson exports
++# PKG_CONFIG_SYSROOT_DIR from sys_root and pkg-config then prepends it to every
++# path in a .pc file, mangling freetype2's -I path into
++# "<sysroot><install-dir>/include/freetype2" (confirmed empirically: this broke
++# the build with "ft2build.h file not found"). The NDK's target-specific clang
++# wrapper (${FAM_CC}) already bakes in --sysroot itself, so meson doesn't need to.
++
++[host_machine]
++system = 'linux'
++cpu_family = '${CPU_FAMILY}'
++cpu = '${TARGET_TRIPLE_MACHINE_ARCH}'
++endian = 'little'
++
++[built-in options]
++prefix = '${INSTALL_DIR}'
++EOF
++
++BUILD_DIRECTORY=build/${ANDROID_ABI}
++
++rm -rf ${BUILD_DIRECTORY}
++
++${MESON_EXECUTABLE} . ${BUILD_DIRECTORY} \
++  --cross-file ${CROSS_FILE_NAME} \
++  --default-library=static \
++  -Dfreetype=enabled \
++  -Dglib=disabled \
++  -Dgobject=disabled \
++  -Dcairo=disabled \
++  -Dchafa=disabled \
++  -Dpng=disabled \
++  -Dzlib=disabled \
++  -Dicu=disabled \
++  -Dtests=disabled \
++  -Dutilities=disabled \
++  -Ddocs=disabled \
++  -Dintrospection=disabled \
++  -Dbenchmark=disabled || exit 1
++
++cd ${BUILD_DIRECTORY}
++
++${NINJA_EXECUTABLE} -j ${HOST_NPROC}
++${NINJA_EXECUTABLE} install
+diff --git a/scripts/libharfbuzz/download.sh b/scripts/libharfbuzz/download.sh
+new file mode 100755
+index 0000000..9b20a42
+--- /dev/null
++++ b/scripts/libharfbuzz/download.sh
+@@ -0,0 +1,9 @@
++#!/usr/bin/env bash
++
++source ${SCRIPTS_DIR}/common-functions.sh
++
++HARFBUZZ_VERSION=14.2.1
++
++downloadTarArchive \
++  "libharfbuzz" \
++  "https://github.com/harfbuzz/harfbuzz/releases/download/${HARFBUZZ_VERSION}/harfbuzz-${HARFBUZZ_VERSION}.tar.xz"
+diff --git a/scripts/parse-arguments.sh b/scripts/parse-arguments.sh
+index 0c746f1..0e6ae4f 100755
+--- a/scripts/parse-arguments.sh
++++ b/scripts/parse-arguments.sh
+@@ -25,6 +25,8 @@ SUPPORTED_LIBRARIES_FREE=(
+   "libwebp"
+   "libfreetype"
+   "libfribidi"
++  "libass"
++  "libharfbuzz"
+   "mbedtls"
+   "libbluray"
+   "libxml2"
+@@ -108,6 +110,14 @@ for argument in "$@"; do
+   --enable-libfribidi | -fribidi)
+     EXTERNAL_LIBRARIES+=("libfribidi")
+     ;;
++  # PocketScript addition: libass (subtitle burn-in) and its harfbuzz dependency.
++  # Neither ships in this framework's stock supported-libraries list.
++  --enable-libass | -ass)
++    EXTERNAL_LIBRARIES+=("libass")
++    ;;
++  --enable-libharfbuzz | -harfbuzz)
++    EXTERNAL_LIBRARIES+=("libharfbuzz")
++    ;;
+   --enable-libx264 | -x264)
+     EXTERNAL_LIBRARIES+=("libx264")
+     FFMPEG_GPL_ENABLED=true
+@@ -121,7 +131,7 @@ for argument in "$@"; do
+     ;;
+   --enable-libbluray | -bluray)
+     EXTERNAL_LIBRARIES+=("libbluray")
+-    ;; 
++    ;;
+   --enable-libxml2 | -xml2)
+     EXTERNAL_LIBRARIES+=("libxml2")
+     ;;
